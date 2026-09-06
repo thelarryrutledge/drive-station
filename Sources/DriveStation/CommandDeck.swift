@@ -122,7 +122,7 @@ struct CommandDeck: View {
                 Rectangle().fill(edge).frame(height: 1)
                 HStack { Circle().fill(cyan).frame(width: 5, height: 5); Micro(text: "LOCAL CONTROL", color: cyan) }
             }.padding(16).background(cyan.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(edge))
-            Micro(text: "DS / MACOS     V.02").padding(.top, 24).padding(.bottom, 23)
+            Micro(text: "DS / MACOS     V.03").padding(.top, 24).padding(.bottom, 23)
         }.padding(.horizontal, 26).frame(width: 220).background(StationTheme.sidebar)
             .overlay(alignment: .trailing) { Rectangle().fill(edge).frame(width: 1) }
     }
