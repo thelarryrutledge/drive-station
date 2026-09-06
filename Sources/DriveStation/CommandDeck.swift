@@ -42,6 +42,7 @@ struct CommandDeck: View {
     @State private var search = ""
     @AppStorage("stationAppearance") private var appearance = "dark"
     @AppStorage("automaticSnapshots") private var automaticSnapshots = true
+    @AppStorage("launchInMenuBar") private var launchInMenuBar = false
     @State private var snapshotSearch = ""
     var filtered: [Drive] {
         station.drives.filter { (filter == "All volumes" || $0.state.rawValue == filter.lowercased()) && (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search)) }
@@ -120,7 +121,7 @@ struct CommandDeck: View {
                 Rectangle().fill(edge).frame(height: 1)
                 HStack { Circle().fill(cyan).frame(width: 5, height: 5); Micro(text: "LOCAL CONTROL", color: cyan) }
             }.padding(16).background(cyan.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(edge))
-            Micro(text: "DS / MACOS     V.01").padding(.top, 24).padding(.bottom, 23)
+            Micro(text: "DS / MACOS     V.02").padding(.top, 24).padding(.bottom, 23)
         }.padding(.horizontal, 26).frame(width: 220).background(StationTheme.sidebar)
             .overlay(alignment: .trailing) { Rectangle().fill(edge).frame(width: 1) }
     }
@@ -130,6 +131,9 @@ struct CommandDeck: View {
             Text("/").foregroundStyle(muted.opacity(0.4))
             Micro(text: page.uppercased(), color: StationTheme.text.opacity(0.8))
             Spacer()
+            Button { NSApp.keyWindow?.close() } label: {
+                Label("Hide to Menu Bar", systemImage: "menubar.rectangle")
+            }.buttonStyle(.plain).help("Close the command deck; Drive Station stays available from the menu bar")
             AppearanceButton().padding(.trailing, 12)
             Circle().fill(station.simulation ? amber : cyan).frame(width: 5, height: 5)
             Micro(text: station.simulation ? "SIMULATION" : "LOCAL SYSTEM", color: station.simulation ? amber : cyan)
@@ -292,7 +296,7 @@ struct CommandDeck: View {
                         Spacer(minLength: 3)
                         volumeOptions(drive)
                         if drive.canStandby {
-                            Button { Task { await station.act(drive, open: false) } } label: { Image(systemName: "moon.zzz").foregroundStyle(amber).padding(10) }.buttonStyle(.plain).help("Standby: safely unmount this volume")
+                            Button { Task { await station.act(drive, open: false) } } label: { Image(systemName: "moon.zzz").foregroundStyle(amber).padding(10) }.buttonStyle(.plain).help("Standby: safely unmount this volume").disabled(station.isSnapshotting(drive))
                         }
                     }
                 }.frame(height: 34).disabled(station.busy)
@@ -320,11 +324,11 @@ struct CommandDeck: View {
                 }
                 Button(drive.internalVolume ? "Capture Home Folder Snapshot" : station.snapshots[drive.id] == nil ? "Capture Snapshot" : "Refresh Snapshot") {
                     Task { await station.captureSnapshot(drive) }
-                }.disabled(drive.state == .offline)
+                }.disabled(drive.state == .offline || station.snapshotProgress != nil)
             }
             if drive.canStandby {
                 Divider()
-                Button("Standby volume") { Task { await station.act(drive, open: false) } }
+                Button("Standby volume") { Task { await station.act(drive, open: false) } }.disabled(station.isSnapshotting(drive))
             }
         } label: { Image(systemName: "ellipsis.circle").foregroundStyle(cyan) }
             .menuStyle(.borderlessButton).fixedSize().help("Volume options").disabled(station.busy)
@@ -402,6 +406,18 @@ struct CommandDeck: View {
                     Toggle("Capture first snapshot of new external drives", isOn: $automaticSnapshots).toggleStyle(.switch).tint(cyan).disabled(station.busy)
                     Text("A snapshot saves filenames, folders and media thumbnails on this Mac. It runs once for a mounted external volume without a snapshot; later updates are manual. Cancel from the capture banner at any time. Internal storage is opt-in and captures your Home folder.").foregroundStyle(muted)
                     Text("Coverage: visible files only; no package contents, symlink traversal, other mounted volumes, or cloud-only downloads. Each capture indexes up to 100,000 items / 2 minutes and attempts up to 300 media thumbnails / 90 seconds. Partial coverage is labeled. This is a catalog, not a backup.").foregroundStyle(muted)
+                    Divider()
+                    Toggle("Launch into the menu bar", isOn: $launchInMenuBar).toggleStyle(.switch).tint(cyan)
+                    Text("When enabled, Drive Station starts without opening the command deck. Select its menu-bar drive icon to open it.").foregroundStyle(muted)
+                    Toggle("Start Drive Station at login", isOn: Binding(get: { LoginItemService.enabled }, set: { enabled in
+                        do {
+                            try LoginItemService.setEnabled(enabled)
+                            if enabled { launchInMenuBar = true }
+                        } catch {
+                            station.error = "Could not change the login-item setting: \(error.localizedDescription)"
+                        }
+                    })).toggleStyle(.switch).tint(cyan)
+                    Text("macOS may ask you to approve this in System Settings. Login launches use the menu-bar mode.").foregroundStyle(muted)
                     Divider()
                     Toggle("Simulation mode", isOn: Binding(get: { station.simulation }, set: { station.setSimulation($0) })).toggleStyle(.switch).tint(cyan).disabled(station.busy)
                     Text("Explore a sample fleet and try the controls. Simulation never operates on your real drives.").foregroundStyle(muted)

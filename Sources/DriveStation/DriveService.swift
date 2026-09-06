@@ -22,7 +22,13 @@ struct Drive: Identifiable, Codable, Equatable {
     static func bytes(_ value: Int64) -> String { ByteCountFormatter.string(fromByteCount: value, countStyle: .decimal) }
     static func parse(_ info: [String: Any], now: Date = Date(), allowInternalRoot: Bool = false) -> Drive? {
         let root = allowInternalRoot && info["Internal"] as? Bool == true && info["MountPoint"] as? String == "/"
-        guard (info["Internal"] as? Bool == false || root),
+        // macOS describes media in some built-in readers (notably SDXC) as
+        // internal even though it is removable. Treat that media like an
+        // external volume, but never admit fixed internal storage.
+        let removable = info["RemovableMediaOrExternalDevice"] as? Bool == true
+            || info["RemovableMedia"] as? Bool == true
+            || info["Removable"] as? Bool == true
+        guard (info["Internal"] as? Bool == false || removable || root),
               info["WholeDisk"] as? Bool == false,
               let uuid = info["VolumeUUID"] as? String, !uuid.isEmpty,
               let name = info["VolumeName"] as? String, !name.isEmpty,
@@ -75,7 +81,9 @@ enum DiskService {
         return result
     }
     static func scan() throws -> [Drive] {
-        let list = try plist(["list", "-plist", "external"])
+        // Do not use `list external`: macOS omits removable cards in built-in
+        // readers because their controller is internal.
+        let list = try plist(["list", "-plist"])
         let identifiers = list["AllDisks"] as? [String] ?? []
         var result: [Drive] = []
         if let root = Drive.parse(try plist(["info", "-plist", "/"]), allowInternalRoot: true) { result.append(root) }
@@ -130,6 +138,8 @@ struct StationEvent: Identifiable {
     @Published var snapshots: [String: SnapshotSummary] = [:]
     @Published var snapshotProgress: String?
     private var snapshotWorker: Task<DriveSnapshot, Error>?
+    private var snapshotCancellation: CaptureCancellation?
+    private var snapshotDriveID: String?
     private var automaticAttempts: Set<String> = []
     private var snapshotCancellationRequested = false
     var drives: [Drive] { simulation ? samples : registry }
@@ -191,7 +201,9 @@ struct StationEvent: Identifiable {
         } catch { self.error = error.localizedDescription; log(error.localizedDescription, failure: true) }
     }
     func act(_ drive: Drive, open: Bool) async {
-        guard !busy, drive.state != .offline else { return }
+        // Finder access is harmless during a capture. Do not allow the source
+        // volume itself to be unmounted until its capture finishes.
+        guard !busy, drive.state != .offline, open || snapshotDriveID != drive.id else { return }
         guard open || drive.canStandby else { return }
         busy = true
         if simulation {
@@ -242,18 +254,20 @@ struct StationEvent: Identifiable {
         } catch { self.error = error.localizedDescription; log(error.localizedDescription, failure: true) }
     }
     func captureSnapshot(_ drive: Drive) async {
-        guard !busy, !simulation, drive.state != .offline else { return }
-        busy = true
+        guard !busy, snapshotWorker == nil, !simulation, drive.state != .offline else { return }
         snapshotCancellationRequested = false
+        let cancellation = CaptureCancellation()
+        snapshotCancellation = cancellation
+        snapshotDriveID = drive.id
         snapshotProgress = "Preparing snapshot · \(drive.name)"
-        defer { busy = false; snapshotProgress = nil; snapshotWorker = nil }
+        defer { snapshotProgress = nil; snapshotWorker = nil; snapshotCancellation = nil; snapshotDriveID = nil }
         var generated: DriveSnapshot?
         do {
             let station = self
             let worker = Task.detached(priority: .utility) {
                 let mount = try DiskService.wake(drive)
                 let source = drive.internalVolume ? FileManager.default.homeDirectoryForCurrentUser : mount
-                let result = try SnapshotCapture.capture(drive: drive, source: source) { message in
+                let result = try SnapshotCapture.capture(drive: drive, source: source, cancellation: cancellation) { message in
                     Task { @MainActor in if station.snapshotWorker != nil { station.snapshotProgress = message } }
                 }
                 do {
@@ -278,7 +292,14 @@ struct StationEvent: Identifiable {
             else { self.error = "Snapshot failed: \(error.localizedDescription)"; log(self.error!, failure: true) }
         }
     }
-    func cancelSnapshot() { snapshotCancellationRequested = true; snapshotWorker?.cancel() }
+    func cancelSnapshot() {
+        guard let cancellation = snapshotCancellation else { return }
+        snapshotCancellationRequested = true
+        cancellation.cancel()
+        snapshotProgress = "Cancelling snapshot…"
+        snapshotWorker?.cancel()
+    }
+    func isSnapshotting(_ drive: Drive) -> Bool { snapshotDriveID == drive.id }
     func browseSnapshot(_ drive: Drive) async {
         guard !busy, let summary = snapshots[drive.id], !simulation else { return }
         busy = true

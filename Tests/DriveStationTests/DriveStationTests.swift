@@ -27,6 +27,15 @@ final class DriveStationTests: XCTestCase {
         info = external; info["APFSVolumeRole"] = ["Recovery"]
         XCTAssertNil(Drive.parse(info))
     }
+    func testRemovableMediaInBuiltInReaderIsManaged() throws {
+        var info = external
+        info["Internal"] = true
+        info["BusProtocol"] = "Secure Digital"
+        info["RemovableMediaOrExternalDevice"] = true
+        let drive = try XCTUnwrap(Drive.parse(info))
+        XCTAssertEqual(drive.name, "Media \(test)")
+        XCTAssertTrue(drive.canStandby)
+    }
     func testUnmountedVolumeIsStandbyAndUnknownFreeStaysUnknown() throws {
         var info = external
         info.removeValue(forKey: "MountPoint")

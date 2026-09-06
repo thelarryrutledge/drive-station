@@ -110,18 +110,27 @@ private final class ThumbnailResult: @unchecked Sendable {
     func get() -> Data? { lock.lock(); defer { lock.unlock() }; return bytes }
 }
 
+final class CaptureCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+}
+
 enum SnapshotCapture {
     static let supported = Set(["jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "gif", "webp", "bmp", "pdf", "mov", "mp4", "m4v"])
-    static func thumbnail(_ url: URL) -> Data? {
+    static func thumbnail(_ url: URL, cancellation: CaptureCancellation?) -> Data? {
+        guard cancellation?.isCancelled != true else { return nil }
         // Downsample photos directly rather than decoding a full-resolution image.
         if let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
            let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 256, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) {
             let data = NSMutableData()
             if let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) {
                 CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.72] as CFDictionary)
-                if CGImageDestinationFinalize(destination) { return data as Data }
+                if CGImageDestinationFinalize(destination), cancellation?.isCancelled != true { return data as Data }
             }
         }
+        guard cancellation?.isCancelled != true else { return nil }
         let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 256, height: 192), scale: 1, representationTypes: .thumbnail)
         let completed = DispatchSemaphore(value: 0)
         let result = ThumbnailResult()
@@ -133,13 +142,24 @@ enum SnapshotCapture {
             CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.72] as CFDictionary)
             if CGImageDestinationFinalize(destination) { result.set(bytes as Data) }
         }
-        if completed.wait(timeout: .now() + 3) == .timedOut { QLThumbnailGenerator.shared.cancel(request); return nil }
+        let deadline = DispatchTime.now() + 3
+        while completed.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
+            if cancellation?.isCancelled == true || DispatchTime.now() >= deadline {
+                QLThumbnailGenerator.shared.cancel(request)
+                return nil
+            }
+        }
+        guard cancellation?.isCancelled != true else { return nil }
         return result.get()
     }
     static func capture(drive: Drive, source: URL, storage: URL = SnapshotStorage.root,
                         maxItems: Int = 100_000, maxThumbnails: Int = 300,
+                        cancellation: CaptureCancellation? = nil,
                         progress: @escaping @Sendable (String) -> Void) throws -> DriveSnapshot {
-        try Task.checkCancellation()
+        func checkCancellation() throws {
+            if Task.isCancelled || cancellation?.isCancelled == true { throw CancellationError() }
+        }
+        try checkCancellation()
         let source = source.resolvingSymlinksInPath().standardizedFileURL
         let manager = FileManager.default
         // A direct read makes a missing or denied root an error, not an empty snapshot.
@@ -158,12 +178,12 @@ enum SnapshotCapture {
         var folders = [source], cursor = 0
         captureLoop: while cursor < folders.count {
             let directory = folders[cursor]; cursor += 1
-            try Task.checkCancellation()
+            try checkCancellation()
             let children: [URL]
             do { children = try manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) }
             catch { unreadable += 1; continue }
             for url in children {
-                try Task.checkCancellation()
+                try checkCancellation()
                 if entries.count >= maxItems || Date() >= deadline { summary.partial = true; break captureLoop }
                 guard let values = try? url.resourceValues(forKeys: Set(keys)) else { unreadable += 1; continue }
                 // Explicit traversal never follows symlinks, other mounted volumes, packages or cloud items.
@@ -180,20 +200,21 @@ enum SnapshotCapture {
         let thumbnailDeadline = Date().addingTimeInterval(90)
         var attempted = 0
         for index in entries.indices {
-            try Task.checkCancellation()
+            try checkCancellation()
             let entry = entries[index]
             guard !entry.directory, !entry.symbolicLink, supported.contains((entry.path as NSString).pathExtension.lowercased()) else { continue }
             guard attempted < maxThumbnails && Date() < thumbnailDeadline else { summary.thumbnailLimitReached = true; break }
             attempted += 1
             progress("Saving thumbnails · \(attempted) / \(maxThumbnails) · \(drive.name)")
-            let image = autoreleasepool { thumbnail(source.appendingPathComponent(entry.path)) }
+            let image = autoreleasepool { thumbnail(source.appendingPathComponent(entry.path), cancellation: cancellation) }
+            try checkCancellation()
             if let image {
                 let filename = "\(index).jpg"
                 try image.write(to: cache.appendingPathComponent(filename), options: .atomic)
                 entries[index].thumbnail = filename; summary.thumbnailCount += 1
             }
         }
-        try Task.checkCancellation()
+        try checkCancellation()
         progress("Saving snapshot · \(drive.name)")
         succeeded = true
         return DriveSnapshot(summary: summary, entries: entries)

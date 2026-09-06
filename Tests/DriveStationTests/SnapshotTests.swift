@@ -72,8 +72,9 @@ final class SnapshotTests: XCTestCase {
         XCTAssertTrue(partial.summary.partial)
         XCTAssertEqual(partial.entries.count, 1)
         let saved = try SnapshotStorage.commit(partial, at: storage)
-        let task = Task { try Task.checkCancellation(); return try SnapshotCapture.capture(drive: drive, source: source, storage: storage, progress: { _ in }) }
-        task.cancel()
+        let cancellation = CaptureCancellation()
+        let task = Task.detached { try SnapshotCapture.capture(drive: drive, source: source, storage: storage, cancellation: cancellation, progress: { _ in }) }
+        cancellation.cancel()
         do { _ = try await task.value; XCTFail("Expected cancellation") } catch is CancellationError { }
         XCTAssertEqual(try SnapshotStorage.catalog(at: storage), saved)
         XCTAssertThrowsError(try SnapshotCapture.capture(drive: drive, source: source.appendingPathComponent("Missing"), storage: storage, progress: { _ in }))

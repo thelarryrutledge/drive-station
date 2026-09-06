@@ -1,7 +1,29 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
+
+final class StationAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard UserDefaults.standard.bool(forKey: "launchInMenuBar") else { return }
+        // Let SwiftUI create its initial window, then leave the app available
+        // from the menu bar without showing the command deck.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            NSApp.windows.filter { $0.title == "Drive Station" }.forEach { $0.close() }
+        }
+    }
+}
+
+enum LoginItemService {
+    static var enabled: Bool { SMAppService.mainApp.status == .enabled }
+    static func setEnabled(_ enabled: Bool) throws {
+        if enabled { try SMAppService.mainApp.register() }
+        else { try SMAppService.mainApp.unregister() }
+    }
+}
 
 @main struct DriveStationApp: App {
+    @NSApplicationDelegateAdaptor(StationAppDelegate.self) private var appDelegate
     @StateObject private var station = Station()
     @AppStorage("stationAppearance") private var appearance = "dark"
     var body: some Scene {
