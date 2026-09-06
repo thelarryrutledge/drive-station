@@ -43,6 +43,7 @@ struct CommandDeck: View {
     @AppStorage("stationAppearance") private var appearance = "dark"
     @AppStorage("automaticSnapshots") private var automaticSnapshots = true
     @AppStorage("launchInMenuBar") private var launchInMenuBar = false
+    @AppStorage("orbitDoubleClickAction") private var orbitDoubleClickAction = "explore"
     @State private var snapshotSearch = ""
     var filtered: [Drive] {
         station.drives.filter { (filter == "All volumes" || $0.state.rawValue == filter.lowercased()) && (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search)) }
@@ -185,7 +186,19 @@ struct CommandDeck: View {
         Panel {
             VStack(alignment: .leading, spacing: 0) {
                 HStack { Micro(text: "ORBITAL MAP", color: StationTheme.text.opacity(0.8)); Spacer(); Micro(text: "CONNECTED STORAGE") }
-                OrbitMap(drives: station.drives, selectedID: station.selected?.id) { station.selectedID = $0 }
+                OrbitMap(
+                    drives: station.drives,
+                    selectedID: station.selected?.id,
+                    select: { station.selectedID = $0 },
+                    activate: { drive in
+                        Task {
+                            if orbitDoubleClickAction == "finder" { await station.act(drive, open: true) }
+                            else { await station.explore(drive) }
+                        }
+                    },
+                    explore: { drive in Task { await station.explore(drive) } },
+                    finder: { drive in Task { await station.act(drive, open: true) } }
+                )
                     .frame(height: 287)
                 HStack(spacing: 18) {
                     ForEach([DriveState.online, .standby, .offline], id: \.self) { state in
@@ -256,7 +269,7 @@ struct CommandDeck: View {
                     }.padding(.vertical, 15)
                 }
             } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 15)], spacing: 15) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 18)], spacing: 18) {
                     ForEach(filtered) { drive in driveCard(drive) }
                 }
             }
@@ -271,12 +284,10 @@ struct CommandDeck: View {
                     Image(systemName: drive.state.symbol).font(.system(size: 9)).foregroundStyle(drive.state.color)
                     Micro(text: drive.state.rawValue.uppercased(), color: drive.state.color)
                 }
-                Button { station.selectedID = drive.id } label: {
-                    VStack(alignment: .leading, spacing: 7) {
-                        Text(drive.name).font(.system(size: 16, weight: .semibold)).lineLimit(1)
-                        Micro(text: "\(drive.connection.uppercased()) / \(drive.format)")
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                }.buttonStyle(.plain).help("Select this volume in telemetry")
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(drive.name).font(.system(size: 16, weight: .semibold)).lineLimit(1)
+                    Micro(text: "\(drive.connection.uppercased()) / \(drive.format)")
+                }.frame(maxWidth: .infinity, alignment: .leading)
                 VStack(spacing: 8) {
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
@@ -310,8 +321,12 @@ struct CommandDeck: View {
                         }.font(.system(size: 10, design: .monospaced))
                     }.buttonStyle(.plain).foregroundStyle(cyan).disabled(station.busy)
                 }
-            }
-        }.overlay(RoundedRectangle(cornerRadius: 10).stroke(station.selected?.id == drive.id ? cyan.opacity(0.35) : .clear))
+            }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(height: 276)
+        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .onTapGesture { station.selectedID = drive.id }
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(station.selected?.id == drive.id ? cyan.opacity(0.65) : .clear, lineWidth: 1.5))
     }
     private func volumeOptions(_ drive: Drive) -> some View {
         Menu {
@@ -419,6 +434,12 @@ struct CommandDeck: View {
                     })).toggleStyle(.switch).tint(cyan)
                     Text("macOS may ask you to approve this in System Settings. Login launches use the menu-bar mode.").foregroundStyle(muted)
                     Divider()
+                    Picker("Orbital-map double-click", selection: $orbitDoubleClickAction) {
+                        Text("Explore in Drive Station").tag("explore")
+                        Text("Open in Finder").tag("finder")
+                    }.pickerStyle(.segmented).frame(maxWidth: 420)
+                    Text("Right-click any orbital-map drive for Explore and Open in Finder. Double-click uses the selected action.").foregroundStyle(muted)
+                    Divider()
                     Toggle("Simulation mode", isOn: Binding(get: { station.simulation }, set: { station.setSimulation($0) })).toggleStyle(.switch).tint(cyan).disabled(station.busy)
                     Text("Explore a sample fleet and try the controls. Simulation never operates on your real drives.").foregroundStyle(muted)
                     Divider()
@@ -466,6 +487,9 @@ private struct OrbitMap: View {
     var drives: [Drive]
     var selectedID: String?
     var select: (String) -> Void
+    var activate: (Drive) -> Void
+    var explore: (Drive) -> Void
+    var finder: (Drive) -> Void
     private func point(_ index: Int, count: Int, size: CGSize) -> CGPoint {
         let angle = Double(index) / Double(max(count, 1)) * .pi * 2 - .pi / 4
         return CGPoint(x: size.width / 2 + cos(angle) * size.width * 0.33, y: size.height / 2 + sin(angle) * size.height * 0.32)
@@ -516,7 +540,15 @@ private struct OrbitMap: View {
                             Text(drive.name.components(separatedBy: " • ").first ?? drive.name).font(.system(size: 10, weight: .medium, design: .monospaced)).tracking(1).lineLimit(1).frame(width: 120)
                             Text(drive.state.rawValue.uppercased()).font(.system(size: 7, design: .monospaced)).tracking(1).foregroundStyle(drive.state.color)
                         }
-                    }.buttonStyle(.plain).position(point(i, count: shown.count, size: geo.size)).accessibilityLabel("Select \(drive.name), \(drive.state.rawValue)")
+                    }
+                    .buttonStyle(.plain)
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { activate(drive) })
+                    .contextMenu {
+                        Button("Explore in Drive Station") { explore(drive) }.disabled(drive.state == .offline)
+                        Button("Open in Finder") { finder(drive) }.disabled(drive.state == .offline)
+                    }
+                    .position(point(i, count: shown.count, size: geo.size))
+                    .accessibilityLabel("Select \(drive.name), \(drive.state.rawValue)")
                 }
                 if drives.isEmpty {
                     Micro(text: "NO EXTERNAL VOLUMES DETECTED").position(x: center.x, y: geo.size.height - 12)
