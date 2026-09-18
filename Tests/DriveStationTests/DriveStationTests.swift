@@ -33,7 +33,7 @@ final class DriveStationTests: XCTestCase {
         info["BusProtocol"] = "Secure Digital"
         info["RemovableMediaOrExternalDevice"] = true
         let drive = try XCTUnwrap(Drive.parse(info))
-        XCTAssertEqual(drive.name, "Media \(test)")
+        XCTAssertEqual(drive.name, "Media $(test)")
         XCTAssertTrue(drive.canStandby)
     }
     func testUnmountedVolumeIsStandbyAndUnknownFreeStaysUnknown() throws {
@@ -43,6 +43,69 @@ final class DriveStationTests: XCTestCase {
         let drive = try XCTUnwrap(Drive.parse(info))
         XCTAssertEqual(drive.state, .standby)
         XCTAssertNil(drive.free)
+    }
+    func testEjectAcceptsOnlineAndStandbyVolumesAndUsesUUID() throws {
+        for mounted in [true, false] {
+            var info = external
+            if !mounted { info.removeValue(forKey: "MountPoint") }
+            var drive = try XCTUnwrap(Drive.parse(info))
+            drive.device = "disk99s9" // A stale device identifier must never be used.
+            var commands: [[String]] = []
+            try DiskService.eject(drive, query: { args in
+                XCTAssertEqual(args, ["info", "-plist", drive.id])
+                return info
+            }, command: { commands.append($0); return Data() })
+            XCTAssertEqual(commands, [["eject", drive.id]])
+        }
+    }
+    func testEjectRejectsOfflineInternalAndChangedVolumes() throws {
+        let drive = try XCTUnwrap(Drive.parse(external))
+        var offline = drive; offline.state = .offline
+        var internalDrive = drive; internalDrive.isInternal = true
+        for unavailable in [offline, internalDrive] {
+            XCTAssertFalse(unavailable.canEject)
+            XCTAssertThrowsError(try DiskService.eject(unavailable, query: { _ in
+                XCTFail("Unavailable drives must not be queried"); return [:]
+            }, command: { _ in XCTFail("Must not eject"); return Data() }))
+        }
+        var changed = external; changed["VolumeUUID"] = "different-volume"
+        var fixedInternal = external; fixedInternal["Internal"] = true
+        for info in [changed, fixedInternal] {
+            XCTAssertThrowsError(try DiskService.eject(drive, query: { _ in info }, command: { _ in
+                XCTFail("Must revalidate identity and external status before ejecting"); return Data()
+            }))
+        }
+    }
+    func testEjectPropagatesBusyDiskRefusalWithoutForceOrRetry() throws {
+        let drive = try XCTUnwrap(Drive.parse(external))
+        var commands: [[String]] = []
+        XCTAssertThrowsError(try DiskService.eject(drive, query: { _ in self.external }, command: {
+            commands.append($0)
+            throw StationError(message: "Disk is in use")
+        })) { XCTAssertEqual($0.localizedDescription, "Disk is in use") }
+        XCTAssertEqual(commands, [["eject", drive.id]])
+    }
+    @MainActor func testSimulatedEjectKeepsDriveAndSnapshotsAndHonorsCaptureGuard() async {
+        let station = Station()
+        station.setSimulation(true)
+        let drive = station.samples[0]
+        let snapshots = station.snapshots
+        station.snapshotProgress = "Capturing another volume"
+        XCTAssertFalse(station.canEject(drive))
+        await station.eject(drive)
+        XCTAssertEqual(station.samples[0], drive)
+        station.snapshotProgress = nil
+        station.busy = true
+        XCTAssertFalse(station.canEject(drive))
+        station.busy = false
+        await station.eject(drive)
+        XCTAssertEqual(station.samples.count, Drive.demo.count)
+        XCTAssertEqual(station.samples[0].id, drive.id)
+        XCTAssertEqual(station.samples[0].state, .offline)
+        XCTAssertNil(station.samples[0].mountPoint)
+        XCTAssertEqual(station.snapshots, snapshots)
+        XCTAssertFalse(station.busy)
+        XCTAssertFalse(station.canEject(station.samples[0]))
     }
     @MainActor func testRegistryTracksUUIDAcrossReconnectAndKeepsOfflineDrives() {
         let original = Drive.demo

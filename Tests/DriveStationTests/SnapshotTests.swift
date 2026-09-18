@@ -37,8 +37,12 @@ final class SnapshotTests: XCTestCase {
         // Remove only this test's source fixture, then load everything from the cache.
         try FileManager.default.removeItem(at: source)
         let data = try SnapshotStorage.load(XCTUnwrap(saved[drive.id]), at: storage)
+        let offlineDrive = try XCTUnwrap(Station.merge([drive], []).first)
+        XCTAssertEqual(offlineDrive.state, .offline)
+        XCTAssertNil(offlineDrive.mountPoint)
+        XCTAssertEqual(try SnapshotStorage.catalog(at: storage), saved)
         let virtualRoot = URL(fileURLWithPath: "/Snapshot/Test", isDirectory: true)
-        let model = ExplorerModel(ExplorerRequest(drive: drive, root: virtualRoot, simulation: false, snapshot: data))
+        let model = ExplorerModel(ExplorerRequest(drive: offlineDrive, root: virtualRoot, simulation: false, snapshot: data))
         await model.load()
         XCTAssertTrue(model.visible.contains { $0.name == "Photos" })
         model.navigate(virtualRoot.appendingPathComponent("Photos"))

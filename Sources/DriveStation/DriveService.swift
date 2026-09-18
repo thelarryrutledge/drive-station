@@ -16,8 +16,11 @@ struct Drive: Identifiable, Codable, Equatable {
     var lastSeen: Date
     // Optional for compatibility with registries written by version 1.0.
     var isInternal: Bool? = nil
+    // Missing in older registries: snapshots remain allowed by default.
+    var doNotSnapshot: Bool? = nil
     var internalVolume: Bool { isInternal == true }
     var canStandby: Bool { !internalVolume && state == .online }
+    var canEject: Bool { !internalVolume && state != .offline }
     var usedFraction: Double { guard capacity > 0, let free else { return 0 }; return min(1, max(0, Double(capacity - free) / Double(capacity))) }
     static func bytes(_ value: Int64) -> String { ByteCountFormatter.string(fromByteCount: value, countStyle: .decimal) }
     static func parse(_ info: [String: Any], now: Date = Date(), allowInternalRoot: Bool = false) -> Drive? {
@@ -94,8 +97,8 @@ enum DiskService {
         }
         return result
     }
-    static func validated(_ drive: Drive) throws -> Drive {
-        let info = try plist(["info", "-plist", drive.internalVolume ? "/" : drive.id])
+    static func validated(_ drive: Drive, query: ([String]) throws -> [String: Any] = plist) throws -> Drive {
+        let info = try query(["info", "-plist", drive.internalVolume ? "/" : drive.id])
         guard let current = Drive.parse(info, allowInternalRoot: drive.internalVolume), current.id == drive.id else {
             throw StationError(message: "This volume is no longer available. Scan your drives and try again.")
         }
@@ -106,6 +109,15 @@ enum DiskService {
         let current = try validated(drive)
         guard current.canStandby else { return }
         _ = try run(["unmount", current.id])
+    }
+    static func eject(_ drive: Drive, query: ([String]) throws -> [String: Any] = plist,
+                      command: ([String]) throws -> Data = run) throws {
+        guard drive.canEject else { throw StationError(message: "Eject is available only for connected external or removable volumes.") }
+        let current = try validated(drive, query: query)
+        guard current.canEject else { throw StationError(message: "This volume cannot be ejected.") }
+        // Resolve by stable UUID, never a cached device number. macOS safely
+        // unmounts the disk's volumes and refuses if any are in use.
+        _ = try command(["eject", current.id])
     }
     static func wake(_ drive: Drive) throws -> URL {
         var current = try validated(drive)
@@ -145,13 +157,14 @@ struct StationEvent: Identifiable {
     var drives: [Drive] { simulation ? samples : registry }
     var selected: Drive? { drives.first(where: { $0.id == selectedID }) ?? drives.first }
     private let registryURL: URL
-    init() {
-        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("DriveStation")
-        registryURL = folder.appendingPathComponent("registry.json")
+    init(registryURL: URL? = nil) {
+        let defaultFolder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("DriveStation")
+        self.registryURL = registryURL ?? defaultFolder.appendingPathComponent("registry.json")
+        let folder = self.registryURL.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: registryURL.path) {
-                registry = try JSONDecoder().decode([Drive].self, from: Data(contentsOf: registryURL)).map { var d = $0; d.state = .offline; d.mountPoint = nil; return d }
+            if FileManager.default.fileExists(atPath: self.registryURL.path) {
+                registry = try JSONDecoder().decode([Drive].self, from: Data(contentsOf: self.registryURL)).map { var d = $0; d.state = .offline; d.mountPoint = nil; return d }
             }
         } catch { self.error = "Could not load the drive registry: \(error.localizedDescription)" }
         do { snapshots = try SnapshotStorage.catalog() }
@@ -168,11 +181,14 @@ struct StationEvent: Identifiable {
     static func merge(_ old: [Drive], _ found: [Drive]) -> [Drive] {
         var result = old.filter { !$0.internalVolume }.map { var d = $0; d.state = .offline; d.mountPoint = nil; return d }
         for drive in found {
+            var updated = drive
+            if let remembered = old.first(where: { $0.id == drive.id }) {
+                updated.doNotSnapshot = remembered.doNotSnapshot
+            }
             if let i = result.firstIndex(where: { $0.id == drive.id }) {
-                var updated = drive
                 if updated.free == nil { updated.free = result[i].free }
                 result[i] = updated
-            } else { result.append(drive) }
+            } else { result.append(updated) }
         }
         return result.sorted { if $0.internalVolume != $1.internalVolume { return $0.internalVolume }; return $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
@@ -187,11 +203,15 @@ struct StationEvent: Identifiable {
             lastScan = Date()
             save()
             log("Scan complete · \(found.count) volume\(found.count == 1 ? "" : "s") connected")
-            let automatic = found.filter { !$0.internalVolume && $0.state == .online && snapshots[$0.id] == nil && !automaticAttempts.contains($0.id) }
+            let automatic = registry.filter { shouldAutomaticallySnapshot($0) }
             if UserDefaults.standard.object(forKey: "automaticSnapshots") as? Bool ?? true {
                 Task { @MainActor in
                     for drive in automatic {
                         guard !self.simulation, self.snapshotProgress == nil else { break }
+                        // Recheck queued drives: their preference may have changed
+                        // while an earlier drive was being captured.
+                        guard self.shouldAutomaticallySnapshot(drive),
+                              UserDefaults.standard.object(forKey: "automaticSnapshots") as? Bool ?? true else { continue }
                         self.automaticAttempts.insert(drive.id)
                         await self.captureSnapshot(drive)
                         if self.snapshotCancellationRequested { break }
@@ -230,6 +250,37 @@ struct StationEvent: Identifiable {
         log(enabled ? "Simulation enabled · sample volumes only" : "Live mode enabled")
         if !enabled { Task { await refresh() } }
     }
+    func canEject(_ drive: Drive) -> Bool {
+        // Eject can affect sibling volumes on the same physical disk. Keep
+        // every eject control unavailable until an active capture finishes.
+        drive.canEject && !busy && snapshotProgress == nil
+    }
+    func eject(_ drive: Drive) async {
+        guard canEject(drive) else { return }
+        busy = true
+        if simulation {
+            if let i = samples.firstIndex(where: { $0.id == drive.id }) {
+                samples[i].state = .offline
+                samples[i].mountPoint = nil
+            }
+            log("SIMULATION / \(drive.name) ejected")
+            busy = false
+            return
+        }
+        do {
+            try await Task.detached(priority: .userInitiated) { try DiskService.eject(drive) }.value
+            if let i = registry.firstIndex(where: { $0.id == drive.id }) {
+                registry[i].state = .offline
+                registry[i].mountPoint = nil
+                save()
+            }
+            log("\(drive.name) · safely ejected · saved snapshots kept")
+        } catch { self.error = error.localizedDescription; log(error.localizedDescription, failure: true) }
+        busy = false
+        // Refresh sibling volumes as well, preserving their registry records
+        // and the independent snapshot catalog when the disk disappears.
+        await refresh()
+    }
     func forget(_ drive: Drive) {
         guard drive.state == .offline, !drive.internalVolume, !busy else { return }
         if simulation { samples.removeAll { $0.id == drive.id } }
@@ -253,8 +304,33 @@ struct StationEvent: Identifiable {
             log("Exploring \(drive.name)")
         } catch { self.error = error.localizedDescription; log(error.localizedDescription, failure: true) }
     }
+    func isSnapshotExcluded(_ drive: Drive) -> Bool {
+        (drives.first(where: { $0.id == drive.id }) ?? drive).doNotSnapshot == true
+    }
+    func setSnapshotExcluded(_ excluded: Bool, for drive: Drive) {
+        guard !busy else { return }
+        if simulation {
+            guard let index = samples.firstIndex(where: { $0.id == drive.id }) else { return }
+            samples[index].doNotSnapshot = excluded
+        } else {
+            guard let index = registry.firstIndex(where: { $0.id == drive.id }) else { return }
+            registry[index].doNotSnapshot = excluded
+            save()
+            if excluded && isSnapshotting(drive) { cancelSnapshot() }
+        }
+        if !excluded { automaticAttempts.remove(drive.id) }
+        log("\(simulation ? "SIMULATION / " : "")\(drive.name) · snapshots \(excluded ? "disabled" : "allowed")")
+    }
+    func shouldAutomaticallySnapshot(_ drive: Drive) -> Bool {
+        !simulation && !drive.internalVolume && drive.state == .online && !isSnapshotExcluded(drive)
+            && snapshots[drive.id] == nil && !automaticAttempts.contains(drive.id)
+    }
+    func canCaptureSnapshot(_ drive: Drive) -> Bool {
+        !busy && snapshotProgress == nil && snapshotWorker == nil && !simulation
+            && drive.state != .offline && !isSnapshotExcluded(drive)
+    }
     func captureSnapshot(_ drive: Drive) async {
-        guard !busy, snapshotWorker == nil, !simulation, drive.state != .offline else { return }
+        guard canCaptureSnapshot(drive) else { return }
         snapshotCancellationRequested = false
         let cancellation = CaptureCancellation()
         snapshotCancellation = cancellation
@@ -265,6 +341,7 @@ struct StationEvent: Identifiable {
         do {
             let station = self
             let worker = Task.detached(priority: .utility) {
+                try Task.checkCancellation()
                 let mount = try DiskService.wake(drive)
                 let source = drive.internalVolume ? FileManager.default.homeDirectoryForCurrentUser : mount
                 let result = try SnapshotCapture.capture(drive: drive, source: source, cancellation: cancellation) { message in

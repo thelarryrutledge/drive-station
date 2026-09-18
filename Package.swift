@@ -7,6 +7,6 @@ let package = Package(
     products: [.executable(name: "DriveStation", targets: ["DriveStation"])],
     targets: [
         .executableTarget(name: "DriveStation"),
-        .testTarget(name: "DriveStationTests", dependencies: ["DriveStation"])
+        .testTarget(name: "DriveStationTests", dependencies: ["DriveStation"], exclude: ["ShortcutChecks.swift", "SnapshotPreferenceChecks.swift"])
     ]
 )

@@ -37,6 +37,8 @@ private struct Panel<Content: View>: View {
 
 struct CommandDeck: View {
     @ObservedObject var station: Station
+    @ObservedObject var shortcut: GlobalShortcut
+    @Environment(\.openWindow) private var openWindow
     @State private var page = "Command deck"
     @State private var filter = "All volumes"
     @State private var search = ""
@@ -86,6 +88,14 @@ struct CommandDeck: View {
         .background(StationTheme.background)
         .foregroundStyle(StationTheme.text)
         .frame(minWidth: 1100, minHeight: 740)
+        .onAppear {
+            // The app owns the registration, so closing this window does not remove it.
+            shortcut.start { [openWindow] in
+                openWindow(id: "station")
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows.first { $0.title == "Drive Station" }?.deminiaturize(nil)
+            }
+        }
         .sheet(item: $station.explorerRequest) { request in FileExplorer(request: request) }
         .alert("Operation needs attention", isPresented: Binding(get: { station.error != nil }, set: { if !$0 { station.error = nil } })) {
             Button("OK") { station.error = nil }
@@ -196,8 +206,7 @@ struct CommandDeck: View {
                             else { await station.explore(drive) }
                         }
                     },
-                    explore: { drive in Task { await station.explore(drive) } },
-                    finder: { drive in Task { await station.act(drive, open: true) } }
+                    menu: { drive in volumeActions(drive) }
                 )
                     .frame(height: 287)
                 HStack(spacing: 18) {
@@ -231,9 +240,9 @@ struct CommandDeck: View {
                     HStack(spacing: 8) {
                         Button { Task { await station.explore(drive) } } label: {
                             Label(drive.state == .standby ? "WAKE & EXPLORE" : "EXPLORE", systemImage: "folder").frame(maxWidth: .infinity)
-                        }.buttonStyle(DeckButton(prominent: true))
+                        }.buttonStyle(DeckButton(prominent: true)).disabled(drive.state == .offline)
                         volumeOptions(drive)
-                    }.disabled(drive.state == .offline || station.busy)
+                    }.disabled(station.busy)
                 } else {
                     Image(systemName: "externaldrive.badge.plus").font(.system(size: 45, weight: .ultraLight)).foregroundStyle(cyan).padding(.top, 27)
                     Text("Awaiting first contact.").font(.system(size: 18, weight: .medium))
@@ -280,6 +289,9 @@ struct CommandDeck: View {
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
                     Image(systemName: drive.internalVolume ? "internaldrive.fill" : "externaldrive.fill").font(.system(size: 24)).foregroundStyle(drive.state.color)
+                    if station.isSnapshotExcluded(drive) {
+                        Text("Snapshots off").font(.system(size: 10)).foregroundStyle(muted)
+                    }
                     Spacer()
                     Image(systemName: drive.state.symbol).font(.system(size: 9)).foregroundStyle(drive.state.color)
                     Micro(text: drive.state.rawValue.uppercased(), color: drive.state.color)
@@ -325,11 +337,16 @@ struct CommandDeck: View {
         }
         .frame(height: 276)
         .contentShape(RoundedRectangle(cornerRadius: 10))
+        .contextMenu { volumeActions(drive) }
         .onTapGesture { station.selectedID = drive.id }
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(station.selected?.id == drive.id ? cyan.opacity(0.65) : .clear, lineWidth: 1.5))
     }
     private func volumeOptions(_ drive: Drive) -> some View {
-        Menu {
+        Menu { volumeActions(drive) } label: { Image(systemName: "ellipsis.circle").foregroundStyle(cyan) }
+            .menuStyle(.borderlessButton).fixedSize().help("Volume options").disabled(station.busy)
+    }
+    @ViewBuilder private func volumeActions(_ drive: Drive) -> some View {
+        Group {
             Button("Explore in Drive Station") { Task { await station.explore(drive) } }.disabled(drive.state == .offline)
             Button("Open in Finder") { Task { await station.act(drive, open: true) } }.disabled(drive.state == .offline)
             if !station.simulation {
@@ -339,14 +356,21 @@ struct CommandDeck: View {
                 }
                 Button(drive.internalVolume ? "Capture Home Folder Snapshot" : station.snapshots[drive.id] == nil ? "Capture Snapshot" : "Refresh Snapshot") {
                     Task { await station.captureSnapshot(drive) }
-                }.disabled(drive.state == .offline || station.snapshotProgress != nil)
+                }.disabled(!station.canCaptureSnapshot(drive))
             }
+            Toggle("Do not snapshot", isOn: Binding(
+                get: { station.isSnapshotExcluded(drive) },
+                set: { station.setSnapshotExcluded($0, for: drive) }
+            ))
             if drive.canStandby {
                 Divider()
                 Button("Standby volume") { Task { await station.act(drive, open: false) } }.disabled(station.isSnapshotting(drive))
             }
-        } label: { Image(systemName: "ellipsis.circle").foregroundStyle(cyan) }
-            .menuStyle(.borderlessButton).fixedSize().help("Volume options").disabled(station.busy)
+            if !drive.internalVolume {
+                Button("Eject", systemImage: "eject") { Task { await station.eject(drive) } }
+                    .disabled(!station.canEject(drive))
+            }
+        }.disabled(station.busy)
     }
     private var snapshotLibrary: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -361,7 +385,7 @@ struct CommandDeck: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Image(systemName: "photo.stack").font(.system(size: 36, weight: .light)).foregroundStyle(cyan)
                         Text("A memory for every drive.").font(.headline)
-                        Text("The first snapshot is captured when a new external volume is discovered online. You can also choose Capture Snapshot in a volume's options menu. Internal storage uses an explicit Home Folder capture.").foregroundStyle(muted)
+                        Text("When automatic snapshots are enabled, the first snapshot is captured when a new external volume is discovered online. Choose Do not snapshot in a drive's options to exclude it, or Capture Snapshot to save one manually. Internal storage uses an explicit Home Folder capture.").foregroundStyle(muted)
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {
@@ -420,6 +444,7 @@ struct CommandDeck: View {
                     Divider()
                     Toggle("Capture first snapshot of new external drives", isOn: $automaticSnapshots).toggleStyle(.switch).tint(cyan).disabled(station.busy)
                     Text("A snapshot saves filenames, folders and media thumbnails on this Mac. It runs once for a mounted external volume without a snapshot; later updates are manual. Cancel from the capture banner at any time. Internal storage is opt-in and captures your Home folder.").foregroundStyle(muted)
+                    Text("For SD cards or other drives you don't need to remember, enable Do not snapshot in the drive's options menu. It stops automatic and manual captures for that volume, including any capture in progress. Existing saved snapshots stay available. Turn it off to allow captures again.").foregroundStyle(muted)
                     Text("Coverage: visible files only; no package contents, symlink traversal, other mounted volumes, or cloud-only downloads. Each capture indexes up to 100,000 items / 2 minutes and attempts up to 300 media thumbnails / 90 seconds. Partial coverage is labeled. This is a catalog, not a backup.").foregroundStyle(muted)
                     Divider()
                     Toggle("Launch into the menu bar", isOn: $launchInMenuBar).toggleStyle(.switch).tint(cyan)
@@ -434,11 +459,13 @@ struct CommandDeck: View {
                     })).toggleStyle(.switch).tint(cyan)
                     Text("macOS may ask you to approve this in System Settings. Login launches use the menu-bar mode.").foregroundStyle(muted)
                     Divider()
+                    ShortcutSettings(shortcut: shortcut)
+                    Divider()
                     Picker("Orbital-map double-click", selection: $orbitDoubleClickAction) {
                         Text("Explore in Drive Station").tag("explore")
                         Text("Open in Finder").tag("finder")
                     }.pickerStyle(.segmented).frame(maxWidth: 420)
-                    Text("Right-click any orbital-map drive for Explore and Open in Finder. Double-click uses the selected action.").foregroundStyle(muted)
+                    Text("Right-click any drive for Explore, Open in Finder, Eject, and saved snapshots. Double-click uses the selected action.").foregroundStyle(muted)
                     Divider()
                     Toggle("Simulation mode", isOn: Binding(get: { station.simulation }, set: { station.setSimulation($0) })).toggleStyle(.switch).tint(cyan).disabled(station.busy)
                     Text("Explore a sample fleet and try the controls. Simulation never operates on your real drives.").foregroundStyle(muted)
@@ -446,6 +473,7 @@ struct CommandDeck: View {
                     Text("How standby works").font(.headline)
                     Text("Standby asks macOS to safely unmount one external volume. Wake & Explore mounts it again and opens the built-in explorer. The volume options menu also offers Open in Finder. Internal storage can be explored but always stays online. If an app is using a volume, macOS can refuse to unmount it; close its files and try again.")
                     Text("Standby is not a hardware sleep command. Other volumes on the same disk may remain active. Reconnecting or rebooting may cause macOS to mount volumes again.")
+                    Text("Eject safely takes the disk offline, including its other volumes. Reconnect it to access original files again. Saved snapshots remain viewable from the drive menu or Snapshot Library. Eject is unavailable while a snapshot capture is running.")
                     Divider()
                     Text("On-demand discovery").font(.headline)
                     Text("The station scans at launch, when you press ⌘R or Scan Drives, after a drive operation, and when leaving simulation. The explorer reads only the folder you open or refresh. Search filters that folder; it does not crawl the drive. Use Scan Drives after connecting or disconnecting a disk.")
@@ -483,13 +511,12 @@ private struct CapacityRing: View {
     }
 }
 
-private struct OrbitMap: View {
+private struct OrbitMap<MenuContent: View>: View {
     var drives: [Drive]
     var selectedID: String?
     var select: (String) -> Void
     var activate: (Drive) -> Void
-    var explore: (Drive) -> Void
-    var finder: (Drive) -> Void
+    @ViewBuilder var menu: (Drive) -> MenuContent
     private func point(_ index: Int, count: Int, size: CGSize) -> CGPoint {
         let angle = Double(index) / Double(max(count, 1)) * .pi * 2 - .pi / 4
         return CGPoint(x: size.width / 2 + cos(angle) * size.width * 0.33, y: size.height / 2 + sin(angle) * size.height * 0.32)
@@ -543,10 +570,7 @@ private struct OrbitMap: View {
                     }
                     .buttonStyle(.plain)
                     .simultaneousGesture(TapGesture(count: 2).onEnded { activate(drive) })
-                    .contextMenu {
-                        Button("Explore in Drive Station") { explore(drive) }.disabled(drive.state == .offline)
-                        Button("Open in Finder") { finder(drive) }.disabled(drive.state == .offline)
-                    }
+                    .contextMenu { menu(drive) }
                     .position(point(i, count: shown.count, size: geo.size))
                     .accessibilityLabel("Select \(drive.name), \(drive.state.rawValue)")
                 }
